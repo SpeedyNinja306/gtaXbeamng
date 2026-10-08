@@ -22,6 +22,7 @@ local pendingPlace
 local pieces, pieceMsgs = {}, {}
 local pieceSerial = 0
 local collisionDirty = false
+local reloadStats = {n = 0, total = 0, max = 0, logAt = 0}
 local debugVisible = false
 -- BeamNG collides with triangles that are clockwise seen from the side they push towards (measured on 0.39:
 -- 'ccw' ground lets the car fall through, 'both' traps wheel nodes between the two faces). 'ccw'/'both' are for tests.
@@ -378,10 +379,39 @@ local function ensureCameraMode()
   end
 end
 
+-- Render camera for the exporter (shared/gxb_frame.h): the camera each frame is rendered with, sent right before
+-- BeamNG renders it. The exporter latches it with that frame's picture, so GTA knows which camera made it.
+local EXPORTER_PORT = 47802
+
+local function writeCamRecord(tag, relative, fov, p, f, u)
+  if not udp then return end
+  udp:sendto(string.format('gxbcam %d %d %.4f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.6f %.6f', tag or -1, relative and 1 or 0,
+    fov, p.x, p.y, p.z, f.x, f.y, f.z, u.x, u.y, u.z), '127.0.0.1', EXPORTER_PORT)
+end
+
+-- The car's box frame: centre, right, forward, up (orthonormal, like GTA's basis() for the same vectors).
+local function carFrame(veh)
+  local c = vec3(be:getObjectOOBBCenterXYZ(vid))
+  local f = vec3(veh:getDirectionVectorXYZ()):normalized()
+  local u = vec3(veh:getDirectionVectorUpXYZ())
+  u = (u - f * u:dot(f)):normalized()
+  return c, f:cross(u), f, u
+end
+
 local function setCamera(m)
-  camera = camera or {pos = vec3(), rot = quat(0, 0, 0, 1), fov = 60}
+  camera = camera or {pos = vec3(), rot = quat(0, 0, 0, 1), fov = 60, fwd = vec3(0, 1, 0), up = vec3(0, 0, 1)}
   camera.pos:set(m.pos[1], m.pos[2], m.pos[3])
-  camera.rot = quatFromDir(v3(m.fwd), v3(m.up))
+  camera.fwd, camera.up = v3(m.fwd), v3(m.up)
+  camera.rot = quatFromDir(camera.fwd, camera.up)
+  camera.tag = m.f
+  -- GTA's camera relative to the car GTA draws (its proxy): rendering from the same offset to BeamNG's car cancels
+  -- the car's own motion out of the picture, however old the picture is when GTA shows it
+  local rel = m.rel
+  if rel and rel.p and rel.f and rel.u then
+    camera.rel = {p = v3(rel.p), f = v3(rel.f), u = v3(rel.u)}
+  else
+    camera.rel = nil
+  end
   if m.fov then
     if fovHorizontal and m.aspect then
       camera.fov = math.deg(2 * math.atan(math.tan(math.rad(m.fov) / 2) * m.aspect))
@@ -390,6 +420,29 @@ local function setCamera(m)
     end
   end
   ensureCameraMode()
+end
+
+-- The camera for the frame BeamNG is about to render.
+local renderCam = {pos = vec3(), rot = quat(0, 0, 0, 1), fov = 60}
+local function renderCamera()
+  if not camera then return nil end
+  local veh = getVeh()
+  local rel = camera.rel
+  if rel and veh then
+    local c, r, f, u = carFrame(veh)
+    local p = c + r * rel.p.x + f * rel.p.y + u * rel.p.z
+    local fw = r * rel.f.x + f * rel.f.y + u * rel.f.z
+    local up = r * rel.u.x + f * rel.u.y + u * rel.u.z
+    renderCam.pos:set(p)
+    renderCam.rot = quatFromDir(fw, up)
+    writeCamRecord(camera.tag, true, camera.fov, rel.p, rel.f, rel.u)
+  else
+    renderCam.pos:set(camera.pos)
+    renderCam.rot = camera.rot
+    writeCamRecord(camera.tag, false, camera.fov, camera.pos, camera.fwd, camera.up)
+  end
+  renderCam.fov = camera.fov
+  return renderCam
 end
 
 -- level -------------------------------------------------------------------
@@ -580,8 +633,21 @@ local function onUpdate(dtReal)
   end
   if lastRecv then setPaused() end
   if collisionDirty then
+    local timer = hptimer()
     be:reloadCollision()
     collisionDirty = false
+    local ms = timer:stop()
+    reloadStats.n = reloadStats.n + 1
+    reloadStats.total = reloadStats.total + ms
+    reloadStats.max = math.max(reloadStats.max, ms)
+  end
+  if clock >= reloadStats.logAt then
+    reloadStats.logAt = clock + 10
+    if reloadStats.n > 0 then
+      log('I', logTag, string.format('collision rebuilds in 10 s: %d, %.1f ms each on average, longest %.1f ms',
+        reloadStats.n, reloadStats.total / reloadStats.n, reloadStats.max))
+    end
+    reloadStats.n, reloadStats.total, reloadStats.max = 0, 0, 0
   end
   if pendingPlace then
     pendingPlace.frames = pendingPlace.frames - 1
@@ -617,7 +683,9 @@ local function onClientEndMission()
   ghosts, trafficCars = {}, {}
 end
 
-M.getCamera = function() return camera end
+-- called by the gtaxbeam camera mode right before rendering (the mode itself is cached for the level's lifetime,
+-- so everything that may change on a hot reload lives here)
+M.getCamera = renderCamera
 
 M.onExtensionLoaded = onExtensionLoaded
 M.onExtensionUnloaded = onExtensionUnloaded

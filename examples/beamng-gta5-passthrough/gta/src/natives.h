@@ -24,6 +24,7 @@ namespace natives
 	inline BOOL IsPauseMenuActive() { return invoke<BOOL>(0xB0034A223497FFCB); }
 	inline int GetFrameCount() { return invoke<int>(0xFC8202EFC642E6F2); }
 	inline int GetGameTimer() { return invoke<int>(0x9CD27B0045628463); }
+	inline float GetFrameTime() { return invoke<float>(0x15C40837039FFAF7); }
 	inline int GetClockHours() { return invoke<int>(0x25223CA6B4D20B7F); }
 	inline int GetClockMinutes() { return invoke<int>(0x13D2B8ADD79640F2); }
 	inline void GetActualScreenResolution(int *x, int *y) { invoke<Void>(0x873C9F3104101DD3, x, y); }

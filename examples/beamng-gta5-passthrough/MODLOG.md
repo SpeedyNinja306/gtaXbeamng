@@ -136,6 +136,54 @@ Pattern 2 passthrough (mashup-mods skill), same shape as `examples/minecraft-gta
     pixels to the exported picture (11712 vs 11713).
   - Looks: BeamNG lights the car itself and nothing matches it to GTA yet. Needs a screenshot to target.
 
+## Stutter work (2026-10-07, measured without GTA)
+- User report: "Very glitchy/laggy when it drives and stutters, still looks weird in motion."
+- Collision rebuilds stall BeamNG: `be:reloadCollision()` itself takes 2-3 ms in Lua, then the engine logs
+  "Loaded Static Collision" at 7 ms (2k triangles) to 17-19 ms (25k triangles). The user's last GTA session had
+  241 rebuilds, a median 0.26 s apart, 18.6 ms on average, at most 37 ms: a hitch several times a second.
+  GTA side now: tile window 3x3 (kTileKeep 1) with hysteresis, so it doesn't flip at tile borders; drops queued
+  until the next tile is sent; walls kept as 2 m world cells, resent at most once a second (4/s when a new wall is
+  within 15 m), slabs joined along the wall direction. The bridge logs rebuild count and cost every 10 s.
+- Car-relative camera: GTA sends its camera in the proxy's box frame (`cam.rel`), BeamNG renders from that offset
+  to its own car at render time. `host/synctest.py` wander at ~10 m/s: world camera, car centre spread 0.1 x 1.3-2.0
+  px (range 6-8 px); car-relative, 0.0 x 0.1 px (range 0.4 px). The car's motion is gone from the picture,
+  whatever its age.
+- Exporter v2 layout: fence per readback copy, the newest finished one published (log: 1.00 frames behind at
+  60-370 fps, 0 not ready); only the car's rectangle is copied (~5% of the screen at 8 m); each picture carries the
+  camera it was rendered with.
+- That camera first went through shared memory written by the bridge with LuaJIT's FFI: BeamNG rejects C function
+  declarations ("invalid C type", BeamNG's own cdefs are structs only). It goes over UDP to the exporter
+  (127.0.0.1:47802) instead. synctest latch (camera swinging +-12 degrees at 1.5 Hz, 120 messages/s): the
+  picture's car position matches the camera tagged on it to 3-5 px rms, the message before/after it 13-17 px, so
+  the tag is the camera that rendered it. Camera sent -> picture published: median 9-14 ms, 90% 16-18 ms.
+- GTA: `GTAxBeam.fx` re-projects BeamNG's picture from its tagged camera to GTA's current one (depth ray-march as
+  in the Minecraft example), only inside the car's projected box. `CarLead` (Motion category, frames) shifts the
+  proxy pose along its velocity, in case GTA draws the proxy a frame off from where the script reads it. The shader
+  compiles in BeamNG's ReShade 6.8.0 (warnings only). Not seen in game yet.
+- Tests: ramtest failed after the others because a held brake at standstill is reverse in BeamNG's arcade gearbox
+  (the car backed off the test pad); the tests now hold with the handbrake and ramtest starts from a fresh car.
+
+## In game with the stutter work (2026-10-07, 21:11)
+- User: looks better, "doesn't look as photoshopped"; still a little choppy but better. The car spawned under the
+  map; driving out of it, it got stuck and shook violently until Franklin died. No screenshot.
+- GTAxBeam.log: the Spawning phase went Active within 50 ms with the car at 99.7 199.8 30.6, the car the host tests
+  had left on the test pad (it keeps sending `veh` until a spawn replaces it). The proxy was made there, Active's
+  ground streaming centred on it and dropped the tiles at the player (beamng.log: 14214 -> 10240 tris right after
+  "spawned"), the new car fell, and tiles probed from 4 m above the fallen car found the surface under GTA's
+  ground (the car drove at z 0.7 throughout). Coming up into the real surface it wedged between both: damage kept
+  rising from 93k to 104k at speed 0.
+- Fix: Spawning only accepts a car state within 15 m of the spawn point; the spawn's player/ground heights are
+  logged. Built; not installed (GTA was still running).
+
+## Diagnosis after spawn-fix run (2026-10-07, 21:33)
+- Spawn was on the street (player z 4.96, ground 4.11, car 4.8). User screenshots: (1) grey underworld disc with
+  GTA seen from below — log spawn 3: 37 m/s, z 5.8→1.1 in 2 s, then z 0.6 at 30–49 m/s; (2) crumpled ETK among GTA
+  traffic — deformation works, lighting/edges still pasted. Overlay not opened (Home).
+- Picture 1–3 GTA frames behind typical, spikes 130–154; uploads 23–90/s; collision rebuilds up to 27/10 s.
+- Root: ground follows a fallen car; 2 m heightfield with holes; walls lag; proxy invincible; alpha=coverage
+  punches out glass; BeamNG occupant ≠ Franklin. Decision: keep this architecture, fix "stay on the road" before
+  any look work. Full write-up in HANDOFF "Diagnosis".
+
 ## Steps
 - [x] Recon (`python -m um scan`), toolchain inventory, BeamNG API reading.
 - [x] BeamNG mod + void level; fake GTA host (`host/fakegta.py`) oracle passes: the car rests on proxy ground,
@@ -148,5 +196,6 @@ Pattern 2 passthrough (mashup-mods skill), same shape as `examples/minecraft-gta
 - [ ] Compositor in GTA: first composite in game (latency, GTA depth buffer found by ReShade).
 
 ## Open questions / to verify in game
-- Cost of `be:reloadCollision()` per tile update.
+- Cost of `be:reloadCollision()` per tile update: 7-19 ms by triangle count (see Stutter work); how often in game
+  after the streaming changes.
 - Dynamic GTA traffic as BeamNG colliders (v1: only GTA side reacts via the proxy vehicle).

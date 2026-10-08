@@ -8,29 +8,17 @@ compares the car's width in pixels with what a vertical or a horizontal 50 degre
     python host/depthcal.py
 """
 import math
-import mmap
 import struct
 import time
 
+import frame
 from fakegta import Link, norm
-
-MAGIC = 0x46425847
 
 
 def newest_frame():
     """(w, h, colour bytes, depth bytes) of the newest published BeamNG frame."""
-    m = mmap.mmap(-1, 4096 + 3 * 3840 * 2160 * 8, tagname="Local\\GTAxBeamFrame", access=mmap.ACCESS_READ)
-    try:
-        magic, = struct.unpack_from("<I", m, 0)
-        if magic != MAGIC:
-            raise SystemExit("no BeamNG frame export (is the ReShade exporter installed?)")
-        stride, = struct.unpack_from("<q", m, 16)
-        slot, = struct.unpack_from("<i", m, 40)
-        w, h = struct.unpack_from("<II", m, 256 + 128 * slot + 24)
-        base = 4096 + stride * slot
-        return w, h, m[base:base + w * h * 4], m[base + w * h * 4:base + w * h * 8]
-    finally:
-        m.close()
+    f = frame.newest_frame()
+    return f.w, f.h, f.colour, f.depth
 
 
 def centre_depth():

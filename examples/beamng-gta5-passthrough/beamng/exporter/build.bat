@@ -10,4 +10,4 @@ call "%VCVARS%" >nul || exit /b 1
 if not exist "%HERE%build" mkdir "%HERE%build"
 cl /nologo /LD /O2 /EHsc /std:c++20 /MT /W3 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
   /I "%RESHADE_INC%" "%HERE%export.cpp" ^
-  /Fo"%HERE%build\\" /Fe"%HERE%build\GTAxBeamExport.addon64" /link user32.lib
+  /Fo"%HERE%build\\" /Fe"%HERE%build\GTAxBeamExport.addon64" /link user32.lib ws2_32.lib

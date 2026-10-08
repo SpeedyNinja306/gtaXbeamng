@@ -1,4 +1,5 @@
--- Global camera that copies GTA's camera exactly (no smoothing, no input), fed by gtaxbeam_bridge.
+-- Global camera that copies GTA's camera exactly (no smoothing, no input), fed by gtaxbeam_bridge. When GTA sends its
+-- camera relative to the car, it is placed relative to BeamNG's car as it is in this very frame.
 
 local C = {}
 C.__index = C

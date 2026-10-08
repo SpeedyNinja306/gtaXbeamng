@@ -29,7 +29,10 @@ namespace
 	constexpr int kTileN = 33;
 	constexpr float kTileStep = 2.0f;
 	constexpr float kTileSize = (kTileN - 1) * kTileStep;
-	constexpr int kTileKeep = 2;         // tiles further than this (in tiles) from the centre are dropped
+	constexpr float kSpawnedWithin = 15.0f; // m from the spawn point: a car state from there is the new car
+	// Every change to BeamNG's collision rebuilds all of it, stalling BeamNG ~20-25 ms (measured with 13 tiles):
+	// keep few tiles, and change walls only when new ones are found.
+	constexpr int kTileKeep = 1;         // tiles further than this (in tiles) from the centre are dropped
 	constexpr int kGroundProbesPerFrame = 384;
 	constexpr float kNoGround = -10000.0f;
 	constexpr int kWallRays = 72;
@@ -37,7 +40,12 @@ namespace
 	constexpr float kWallRange = 35.0f;
 	constexpr float kWallMaxNormalZ = 0.6f; // steeper than ~53 degrees counts as a wall
 	constexpr int kProbeFlags = 1 | 16;    // map + objects (not vehicles or peds)
-	constexpr int kWallResendMs = 250;
+	constexpr float kWallCell = 2.0f;      // wall hits are kept per world cell of this size (m)
+	constexpr float kWallKeep = 55.0f;     // cells further than this from the car are forgotten (at the next resend)
+	constexpr int kWallMaxCells = 400;
+	constexpr int kWallResendMs = 1000;
+	constexpr float kWallUrgent = 15.0f; // m: a new surface this close is sent after kWallResendUrgentMs
+	constexpr int kWallResendUrgentMs = 250;
 	constexpr float kProxySnapDist = 3.0f; // metres off BeamNG's pose before the proxy is teleported instead of steered
 	constexpr float kProxyGain = 12.0f;    // 1/s: position error turned into extra velocity
 	constexpr int kLinkTimeoutMs = 2500;
@@ -82,10 +90,10 @@ namespace
 		bool sent = false;
 	};
 
-	struct WallHit
+	/// A steep surface found in one world cell: where the probe hit it, its normal, and the height range to block.
+	struct WallCell
 	{
-		bool hit = false;
-		float x = 0, y = 0, z = 0, dist = 0;
+		float x = 0, y = 0, nx = 0, ny = 0, zLo = 0, zHi = 0;
 	};
 
 	HMODULE g_module = nullptr;
@@ -104,7 +112,13 @@ namespace
 
 	float g_spawnPos[3] = {}, g_spawnFwd[3] = {0, 1, 0};
 	std::map<std::pair<int, int>, Tile> g_tiles;
-	WallHit g_wallHits[kWallRays];
+	std::vector<std::pair<int, int>> g_tileDrops; // sent together with the next tile, so BeamNG rebuilds once
+	std::pair<int, int> g_tileCentre{0, 0};
+	bool g_tileCentreSet = false;
+	std::map<std::pair<int, int>, WallCell> g_wallCells;
+	bool g_wallsDirty = false;
+	float g_wallsNearestNew = 1e9f;
+	int g_wallsSentAt = -100000;
 	int g_wallNext = 0;
 
 	// ---------------------------------------------------------------- helpers
@@ -275,17 +289,38 @@ namespace
 	/// Probe GTA's ground for the 3x3 tiles around (cx, cy); true once all of them have been sent.
 	bool stream_ground(float cx, float cy, float cz)
 	{
-		const auto centre = tile_of(cx, cy);
+		// move the 3x3 window only once the point is a quarter tile into another tile (no churn along a border)
+		const auto at = tile_of(cx, cy);
+		if (!g_tileCentreSet)
+		{
+			g_tileCentre = at;
+			g_tileCentreSet = true;
+		}
+		else if (at != g_tileCentre)
+		{
+			const float fx = cx / kTileSize - at.first, fy = cy / kTileSize - at.second;
+			const bool deepX = at.first == g_tileCentre.first || (fx > 0.25f && fx < 0.75f);
+			const bool deepY = at.second == g_tileCentre.second || (fy > 0.25f && fy < 0.75f);
+			if ((deepX && deepY) || std::abs(at.first - g_tileCentre.first) > 1 || std::abs(at.second - g_tileCentre.second) > 1)
+				g_tileCentre = at;
+		}
+		const auto centre = g_tileCentre;
 		for (auto it = g_tiles.begin(); it != g_tiles.end();)
 		{
 			if (std::abs(it->first.first - centre.first) > kTileKeep || std::abs(it->first.second - centre.second) > kTileKeep)
 			{
-				bng::sendf("{\"t\":\"drop\",\"id\":\"g%d_%d\"}", it->first.first, it->first.second);
+				if (it->second.sent)
+					g_tileDrops.push_back(it->first);
 				it = g_tiles.erase(it);
 			}
 			else
 				++it;
 		}
+		auto send_drops = [] {
+			for (const auto &k : g_tileDrops)
+				bng::sendf("{\"t\":\"drop\",\"id\":\"g%d_%d\"}", k.first, k.second);
+			g_tileDrops.clear();
+		};
 		// centre first, then its neighbours
 		static const int order[9][2] = {{0, 0}, {0, 1}, {1, 0}, {0, -1}, {-1, 0}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
 		int budget = kGroundProbesPerFrame;
@@ -313,15 +348,21 @@ namespace
 			}
 			if (t.next == kTileN * kTileN && !t.sent)
 			{
+				send_drops();
 				send_tile(key, t);
 				t.sent = true;
 			}
 			ready = ready && t.sent;
 		}
+		if (ready && !g_tileDrops.empty())
+			send_drops();
 		return ready;
 	}
 
-	/// Radial probes around the car for steep surfaces (buildings, walls, poles); sent as wall quads once per sweep.
+	/// Radial probes around the car for steep surfaces (buildings, walls, poles). Hits are kept per world cell, so the
+	/// set only changes when a new surface is found (not as the hit points slide along a wall while the car moves),
+	/// and resent at most every kWallResendMs: each slab runs along the surface (from the hit normal), long enough to
+	/// join its neighbours, short where it stands alone (a pole).
 	void stream_walls(const float c[3], float groundZ)
 	{
 		const Ped ped = natives::PlayerPedId();
@@ -332,72 +373,98 @@ namespace
 			g_wallNext = (g_wallNext + 1) % kWallRays;
 			const float a = i * 6.2831853f / kWallRays;
 			const float dx = std::cos(a), dy = std::sin(a);
-			WallHit &w = g_wallHits[i];
-			w.hit = false;
 			const int handle = natives::StartShapeTestLosProbeSync(c[0], c[1], z, c[0] + dx * kWallRange, c[1] + dy * kWallRange, z,
 				kProbeFlags, g_proxy ? g_proxy : ped);
 			BOOL hit = FALSE;
 			Vector3 end = {}, normal = {};
 			Entity entity = 0;
-			if (natives::GetShapeTestResult(handle, &hit, &end, &normal, &entity) == 2 && hit && std::abs(normal.z) < kWallMaxNormalZ)
+			if (natives::GetShapeTestResult(handle, &hit, &end, &normal, &entity) != 2 || !hit || std::abs(normal.z) >= kWallMaxNormalZ)
+				continue;
+			const std::pair<int, int> key{int(std::floor(end.x / kWallCell)), int(std::floor(end.y / kWallCell))};
+			auto found = g_wallCells.find(key);
+			if (found == g_wallCells.end())
 			{
-				w.hit = true;
+				WallCell w;
 				w.x = end.x;
 				w.y = end.y;
-				w.z = end.z;
-				w.dist = std::sqrt((end.x - c[0]) * (end.x - c[0]) + (end.y - c[1]) * (end.y - c[1]));
+				const float nl = std::sqrt(normal.x * normal.x + normal.y * normal.y);
+				w.nx = nl > 1e-3f ? normal.x / nl : -dx;
+				w.ny = nl > 1e-3f ? normal.y / nl : -dy;
+				w.zLo = end.z - 1.5f;
+				w.zHi = end.z + 3.5f;
+				g_wallCells.emplace(key, w);
+				g_wallsDirty = true;
+				const float hx = end.x - c[0], hy = end.y - c[1];
+				g_wallsNearestNew = std::min(g_wallsNearestNew, std::sqrt(hx * hx + hy * hy));
 			}
-			if (g_wallNext != 0)
-				continue;
-			// a sweep is complete: join neighbouring hits at similar distances, give lone hits (poles) a short face
-			std::string s = "{\"t\":\"walls\",\"id\":\"radial\",\"segs\":[";
-			bool first = true;
-			char seg[160];
-			for (int n = 0; n < kWallRays; ++n)
+			else if (end.z - 1.5f < found->second.zLo - 0.5f || end.z + 3.5f > found->second.zHi + 0.5f)
 			{
-				const WallHit &h = g_wallHits[n];
-				if (!h.hit)
-					continue;
-				const WallHit &next = g_wallHits[(n + 1) % kWallRays];
-				const WallHit &prev = g_wallHits[(n + kWallRays - 1) % kWallRays];
-				float x1, y1, x2, y2;
-				if (next.hit && std::abs(next.dist - h.dist) < 2.5f)
-				{
-					x1 = h.x, y1 = h.y, x2 = next.x, y2 = next.y;
-				}
-				else if (!prev.hit || std::abs(prev.dist - h.dist) >= 2.5f)
-				{
-					const float a = n * 6.2831853f / kWallRays;
-					const float px = -std::sin(a) * 0.4f, py = std::cos(a) * 0.4f;
-					x1 = h.x - px, y1 = h.y - py, x2 = h.x + px, y2 = h.y + py;
-				}
-				else
-					continue;
-				const int len = std::snprintf(seg, sizeof(seg), "%s[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]", first ? "" : ",", x1, y1, x2, y2,
-					h.z - 1.5f, h.z + 3.5f);
-				s.append(seg, len);
-				first = false;
+				found->second.zLo = std::min(found->second.zLo, end.z - 1.5f);
+				found->second.zHi = std::max(found->second.zHi, end.z + 3.5f);
+				g_wallsDirty = true;
 			}
-			s += "]}";
-			// every resend rebuilds BeamNG's collision, so only when something changed and at most every kWallResendMs
-			static std::string lastSent;
-			static int lastSentAt = -100000;
-			if (s == lastSent || now() - lastSentAt < kWallResendMs)
-				continue;
-			lastSent = s;
-			lastSentAt = now();
-			if (first)
-				bng::sendf("{\"t\":\"drop\",\"id\":\"radial\"}");
-			else
-				bng::send(s.data(), int(s.size()));
 		}
+		// a surface found close by can't wait as long as one far ahead
+		if (!g_wallsDirty || now() - g_wallsSentAt < (g_wallsNearestNew < kWallUrgent ? kWallResendUrgentMs : kWallResendMs))
+			return;
+		g_wallsDirty = false;
+		g_wallsNearestNew = 1e9f;
+		g_wallsSentAt = now();
+		std::vector<std::pair<float, std::pair<int, int>>> kept;
+		for (auto it = g_wallCells.begin(); it != g_wallCells.end();)
+		{
+			const float ex = it->second.x - c[0], ey = it->second.y - c[1];
+			const float d2 = ex * ex + ey * ey;
+			if (d2 > kWallKeep * kWallKeep)
+				it = g_wallCells.erase(it);
+			else
+			{
+				kept.emplace_back(d2, it->first);
+				++it;
+			}
+		}
+		if (kept.size() > size_t(kWallMaxCells))
+		{
+			std::sort(kept.begin(), kept.end());
+			for (size_t n = kWallMaxCells; n < kept.size(); ++n)
+				g_wallCells.erase(kept[n].second);
+			kept.resize(kWallMaxCells);
+		}
+		if (kept.empty())
+		{
+			bng::sendf("{\"t\":\"drop\",\"id\":\"radial\"}");
+			return;
+		}
+		std::string s = "{\"t\":\"walls\",\"id\":\"radial\",\"segs\":[";
+		char seg[160];
+		bool first = true;
+		for (const auto &n : kept)
+		{
+			const WallCell &w = g_wallCells[n.second];
+			bool joined = false;
+			for (int oy = -1; oy <= 1 && !joined; ++oy)
+				for (int ox = -1; ox <= 1 && !joined; ++ox)
+					joined = (ox || oy) && g_wallCells.count({n.second.first + ox, n.second.second + oy});
+			const float half = joined ? kWallCell * 0.6f : 0.4f;
+			const float tx = -w.ny * half, ty = w.nx * half;
+			const int len = std::snprintf(seg, sizeof(seg), "%s[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]", first ? "" : ",", w.x - tx, w.y - ty,
+				w.x + tx, w.y + ty, w.zLo, w.zHi);
+			s.append(seg, len);
+			first = false;
+		}
+		s += "]}";
+		bng::send(s.data(), int(s.size()));
 	}
 
 	void clear_streaming()
 	{
 		g_tiles.clear();
-		for (WallHit &w : g_wallHits)
-			w = WallHit();
+		g_tileDrops.clear();
+		g_tileCentreSet = false;
+		g_wallCells.clear();
+		g_wallsDirty = false;
+		g_wallsNearestNew = 1e9f;
+		g_wallsSentAt = -100000;
 		g_wallNext = 0;
 		bng::sendf("{\"t\":\"clear\"}");
 	}
@@ -502,6 +569,23 @@ namespace
 		natives::SetEntityQuaternion(g_proxy, q[0], q[1], q[2], q[3]);
 	}
 
+	/// The car as GTA draws it: the proxy's pose, with BeamNG's box centre where proxy_follow puts it.
+	bool proxy_box_frame(float c[3], float r[3], float f[3], float u[3])
+	{
+		if (!g_proxy || !g_veh.valid || !natives::DoesEntityExist(g_proxy))
+			return false;
+		Vector3 a = {}, b = {}, up = {}, pos = {};
+		natives::GetEntityMatrix(g_proxy, &a, &b, &up, &pos);
+		const Vector3 fv = natives::GetEntityForwardVector(g_proxy);
+		const float fwdIn[3] = {fv.x, fv.y, fv.z}, upIn[3] = {up.x, up.y, up.z};
+		basis(fwdIn, upIn, r, f, u);
+		const float p[3] = {pos.x, pos.y, pos.z};
+		const float *k = g_proxyCentre;
+		for (int i = 0; i < 3; ++i)
+			c[i] = p[i] + r[i] * k[0] + f[i] * k[1] + u[i] * (k[2] + g_veh.half[2]);
+		return true;
+	}
+
 	void draw_box()
 	{
 		float r[3], f[3], u[3];
@@ -565,16 +649,44 @@ namespace
 
 	// ---------------------------------------------------------------- per frame
 
+	/// GTA's camera to BeamNG, in world space and, while the car exists, relative to it: BeamNG renders from the same
+	/// offset to its own car, so the car's motion drops out of the picture and GTA draws it locked to the proxy.
 	void send_camera()
 	{
 		const Vector3 c = natives::GetFinalRenderedCamCoord();
-		const Vector3 r = natives::GetFinalRenderedCamRot(2);
+		const Vector3 rot = natives::GetFinalRenderedCamRot(2);
 		float f[3], u[3];
-		cam_vectors(r, f, u);
+		cam_vectors(rot, f, u);
+		const int tag = natives::GetFrameCount();
+		compositor::CarView view;
+		char rel[200] = "";
+		float bc[3], br[3], bf[3], bu[3];
+		if (g_phase == Phase::Active && proxy_box_frame(bc, br, bf, bu))
+		{
+			const float d[3] = {c.x - bc[0], c.y - bc[1], c.z - bc[2]};
+			const Vector3 v = natives::GetEntityVelocity(g_proxy);
+			const float vel[3] = {v.x, v.y, v.z};
+			view.valid = true;
+			view.tag = tag;
+			for (int i = 0; i < 3; ++i)
+				view.half[i] = g_veh.half[i];
+			const float *axes[3] = {br, bf, bu};
+			for (int i = 0; i < 3; ++i)
+			{
+				view.pos[i] = dot(d, axes[i]);
+				view.fwd[i] = dot(f, axes[i]);
+				view.up[i] = dot(u, axes[i]);
+				view.vel[i] = dot(vel, axes[i]);
+			}
+			view.frameTime = natives::GetFrameTime();
+			std::snprintf(rel, sizeof(rel), ",\"rel\":{\"p\":[%.4f,%.4f,%.4f],\"f\":[%.5f,%.5f,%.5f],\"u\":[%.5f,%.5f,%.5f]}", view.pos[0],
+				view.pos[1], view.pos[2], view.fwd[0], view.fwd[1], view.fwd[2], view.up[0], view.up[1], view.up[2]);
+		}
+		compositor::set_car_view(view);
 		bng::sendf("{\"t\":\"cam\",\"f\":%d,\"pos\":[%.4f,%.4f,%.4f],\"fwd\":[%.5f,%.5f,%.5f],\"up\":[%.5f,%.5f,%.5f],\"fov\":%.3f,"
-				   "\"near\":%.4f,\"far\":%.1f}",
-			natives::GetFrameCount(), c.x, c.y, c.z, f[0], f[1], f[2], u[0], u[1], u[2], natives::GetFinalRenderedCamFov(),
-			natives::GetFinalRenderedCamNearClip(), natives::GetFinalRenderedCamFarClip());
+				   "\"near\":%.4f,\"far\":%.1f%s}",
+			tag, c.x, c.y, c.z, f[0], f[1], f[2], u[0], u[1], u[2], natives::GetFinalRenderedCamFov(), natives::GetFinalRenderedCamNearClip(),
+			natives::GetFinalRenderedCamFarClip(), rel);
 	}
 
 	/// GTA's vehicles near the BeamNG car (the nearest kTrafficMax, the player's own included): BeamNG moves a hidden
@@ -638,7 +750,9 @@ namespace
 		const Vector3 p = natives::GetEntityCoords(ped, TRUE);
 		const Vector3 fv = natives::GetEntityForwardVector(ped);
 		float gz = p.z - 1.0f;
-		natives::GetGroundZFor3dCoord(p.x + fv.x * 6.0f, p.y + fv.y * 6.0f, p.z + 3.0f, &gz, TRUE, FALSE);
+		const bool hit = natives::GetGroundZFor3dCoord(p.x + fv.x * 6.0f, p.y + fv.y * 6.0f, p.z + 3.0f, &gz, TRUE, FALSE);
+		log_line("spawn at %.1f %.1f: player z %.2f, ground z %.2f%s", p.x + fv.x * 6.0f, p.y + fv.y * 6.0f, p.z, gz,
+			hit ? "" : " (no ground found, below the player)");
 		g_spawnPos[0] = p.x + fv.x * 6.0f;
 		g_spawnPos[1] = p.y + fv.y * 6.0f;
 		g_spawnPos[2] = gz;
@@ -751,7 +865,11 @@ namespace
 			}
 			break;
 		case Phase::Spawning:
-			if (g_veh.valid && proxy_create())
+		{
+			// states from a car BeamNG already had keep arriving until the spawn replaces it: wait for one at the spot
+			const float dx = g_veh.pos[0] - g_spawnPos[0], dy = g_veh.pos[1] - g_spawnPos[1];
+			const bool spawned = g_veh.valid && dx * dx + dy * dy < kSpawnedWithin * kSpawnedWithin;
+			if (spawned && proxy_create())
 			{
 				set_phase(Phase::Active);
 				notify("GTAxBeam: BeamNG %s ready - get in with F", g_cfg.model);
@@ -762,6 +880,7 @@ namespace
 				set_phase(Phase::Idle);
 			}
 			break;
+		}
 		case Phase::Active:
 		{
 			const Ped ped = natives::PlayerPedId();

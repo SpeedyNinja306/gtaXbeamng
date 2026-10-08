@@ -10,7 +10,7 @@ and is pushed forwards.
 import time
 
 from depthcal import newest_frame
-from fakegta import Link, chase_cam, norm
+from fakegta import GROUND_Z, ORIGIN, Link, chase_cam, norm
 
 GTA_ID = 4242
 HALF = [0.95, 2.4, 0.7]
@@ -25,7 +25,21 @@ def main():
         time.sleep(0.05)
     if not link.veh:
         raise SystemExit("no BeamNG car (run fakegta.py first)")
+    # a fresh car on open ground (fakegta.py leaves it wrapped around its test wall, which would stop the push)
+    link.send(t="spawn", model="etk800", pos=[ORIGIN[0], ORIGIN[1] - 80, GROUND_Z], fwd=[0, 1, 0], up=[0, 0, 1])
+    link.veh["dmg"] = 1e9
+    settled = None
+    end = time.perf_counter() + 20
+    while time.perf_counter() < end and not (settled and time.perf_counter() > settled):
+        link.pump()
+        link.send(t="input", th=0, br=0, st=0, hb=1)  # brake held at a standstill is reverse in BeamNG's arcade gearbox
+        chase_cam(link)
+        if settled is None and link.veh["dmg"] < 100:
+            settled = time.perf_counter() + 2.0
+        time.sleep(1 / 60)
     v = link.veh
+    if v["dmg"] > 100 or abs(v["pos"][2] - GROUND_Z) > 2:
+        raise SystemExit(f"no fresh car on the test pad (damage {v['dmg']:.0f}): run fakegta.py first")
     fwd = norm([v["fwd"][0], v["fwd"][1], 0.0])
     start = [v["pos"][i] - fwd[i] * 20 for i in range(2)] + [v["pos"][2]]
     dmg0, pos0 = v["dmg"], list(v["pos"])

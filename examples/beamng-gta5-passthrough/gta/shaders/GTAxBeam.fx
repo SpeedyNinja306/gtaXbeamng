@@ -1,20 +1,39 @@
-// Composites BeamNG.drive's car into GTA V (GTA x BeamNG). The GTAxBeam add-on (in GTAxBeam.asi) uploads BeamNG's
-// latest frame into BNGCOLOR (premultiplied: alpha = BeamNG drew geometry there) and BNGDEPTH (BeamNG's raw depth),
-// and sets the camera uniforms. BeamNG renders from GTA's camera, so a GTA pixel's view ray lands at the same angle
-// in BeamNG's picture; the car shows where it is nearer than GTA's depth buffer.
+// Composites BeamNG.drive's car into GTA V (GTA x BeamNG). The GTAxBeam add-on (in GTAxBeam.asi) uploads the part of
+// BeamNG's latest frame that holds the car (BngRect) into BNGCOLOR (premultiplied: alpha = BeamNG drew geometry there)
+// and BNGDEPTH (BeamNG's raw depth), and sets the camera uniforms. BeamNG renders from GTA's camera relative to the car,
+// a few frames before GTA shows the picture: each GTA pixel's view ray is moved into the camera BeamNG rendered with
+// (WarpRow*, WarpT) and marched until it meets the car; the car shows where it is nearer than GTA's depth buffer.
 #include "ReShade.fxh"
 
 texture BngColorTex : BNGCOLOR;
 texture BngDepthTex : BNGDEPTH;
-sampler sBngColor { Texture = BngColorTex; AddressU = BORDER; AddressV = BORDER; };
-sampler sBngDepth { Texture = BngDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = BORDER; AddressV = BORDER; };
+sampler sBngColor { Texture = BngColorTex; AddressU = CLAMP; AddressV = CLAMP; };
+sampler sBngDepth { Texture = BngDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 
 // Set by the add-on: true only while BeamNG frames are arriving; until then GTA passes through untouched.
 uniform bool BngActive = false;
-// Set by the add-on: GTA's camera near/far clip, tan(GTA's vertical fov / 2), BeamNG's frame size.
+// Set by the add-on: GTA's camera near/far clip, tan(GTA's vertical fov / 2), BeamNG's frame size, tan(BeamNG's
+// vertical fov / 2), and the rectangle of BeamNG's frame that was uploaded (x, y, width, height in pixels; it sits in
+// the textures' top-left corner).
 uniform float2 HostPlanes = float2(0.15, 10000.0);
 uniform float HostTan = 0.466;
 uniform float2 BngSize = float2(1600.0, 900.0);
+uniform float BngTan = 0.466;
+uniform float4 BngRect = float4(0.0, 0.0, 0.0, 0.0);
+// Set by the add-on: rows of the rotation and the translation from GTA's current camera space to the camera space of
+// the uploaded frame (both relative to the car; x right, y up, -z forward), and the car's rectangle on GTA's screen
+// (uv min, uv max). WarpOn is false when the frame wasn't rendered car-relative.
+uniform bool WarpOn = false;
+uniform float3 WarpRow0 = float3(1.0, 0.0, 0.0);
+uniform float3 WarpRow1 = float3(0.0, 1.0, 0.0);
+uniform float3 WarpRow2 = float3(0.0, 0.0, 1.0);
+uniform float3 WarpT = float3(0.0, 0.0, 0.0);
+uniform float4 CarRect = float4(0.0, 0.0, 1.0, 1.0);
+
+uniform bool Reproject < ui_category = "Motion"; ui_label = "Re-project to GTA's camera";
+	ui_tooltip = "Move BeamNG's (a few frames older) picture onto GTA's current view of the car."; > = true;
+uniform float CarLead < ui_category = "Motion"; ui_type = "drag"; ui_min = -3.0; ui_max = 3.0; ui_step = 0.05; ui_label = "Car lead (frames)";
+	ui_tooltip = "Moves the drawn car along its velocity by this many frames. If at speed the car slides ahead of (or behind) the road, its shadow and GTA traffic, adjust until it sits still."; > = 0.0;
 
 uniform bool HostReversedZ < ui_category = "Calibration"; ui_label = "GTA depth is reversed"; > = true;
 // BeamNG 0.39.4 (D3D12) in the gtaxbeam_void level, measured with host/depthcal.py: reversed Z, near 0.1, far 4172
@@ -61,14 +80,99 @@ float3 bands(float z)
 	return lerp(float3(0.1, 0.1, 0.1), float3(1.0, 0.85, 0.3), step(0.5, frac(z))) * saturate(1.5 - z / 100.0);
 }
 
-/// Where this GTA pixel's view ray lands in BeamNG's picture (same camera, possibly another aspect and fov convention).
+/// Whether a point of BeamNG's picture (uv over the whole frame) is inside the uploaded rectangle.
+bool in_rect(float2 puv)
+{
+	const float2 p = puv * BngSize - BngRect.xy;
+	return BngRect.z > 0.0 && all(p >= 0.0) && all(p <= BngRect.zw);
+}
+
+/// Texture coordinate of a point of BeamNG's picture (kept half a texel inside the rectangle: the texels beyond it
+/// are left over from older frames).
+float2 rect_tex(float2 puv)
+{
+	const float2 p = clamp(puv * BngSize - BngRect.xy, 0.5, max(BngRect.zw - 0.5, 0.5));
+	return p / BngSize;
+}
+
+float4 bng_color(float2 puv)
+{
+	return in_rect(puv) ? tex2Dlod(sBngColor, float4(rect_tex(puv), 0, 0)) : 0.0;
+}
+
+/// Linear depth (m) of BeamNG's picture at puv; 1e9 where it drew nothing.
+float bng_depth(float2 puv)
+{
+	return in_rect(puv) ? bng_linear(tex2Dlod(sBngDepth, float4(rect_tex(puv), 0, 0)).r) : 1e9;
+}
+
+/// Where this GTA pixel's view ray lands in BeamNG's picture without re-projection (same camera).
 float2 bng_uv(float2 uv)
 {
 	const float aspectHost = BUFFER_WIDTH * BUFFER_RCP_HEIGHT, aspectBng = BngSize.x / BngSize.y;
 	const float2 ray = float2((uv.x * 2.0 - 1.0) * aspectHost, 1.0 - uv.y * 2.0) * HostTan;
-	const float tanBng = HostTan * FovScale;
+	const float tanBng = BngTan * FovScale;
 	const float2 n = ray / float2(tanBng * aspectBng, tanBng);
 	return float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5) + Offset;
+}
+
+float3 warp(float3 p)
+{
+	return float3(dot(WarpRow0, p), dot(WarpRow1, p), dot(WarpRow2, p)) + WarpT;
+}
+
+/// BeamNG picture uv of a point in the camera space BeamNG rendered with; false when off the picture or behind.
+bool bng_project(float3 pm, out float2 puv)
+{
+	puv = 0.0;
+	if (pm.z > -1e-3)
+		return false;
+	const float tanBng = BngTan * FovScale;
+	const float2 n = pm.xy / -pm.z / float2(tanBng * BngSize.x / BngSize.y, tanBng);
+	puv = float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5) + Offset;
+	return all(abs(n) <= 1.0);
+}
+
+/// March this GTA pixel's view ray from near to zFar, moving each point into the camera BeamNG rendered with. The
+/// first point behind BeamNG's surface there is where the car is seen: refine on the surface (fixed point on its
+/// depth along GTA's ray) and return its picture uv and GTA view depth.
+bool reproject(float2 uv, float zFar, out float2 puv, out float zg)
+{
+	const float3 ray = float3((uv.x * 2.0 - 1.0) * HostTan * BUFFER_WIDTH * BUFFER_RCP_HEIGHT, (1.0 - uv.y * 2.0) * HostTan, -1.0);
+	const float zNear = 0.3;
+	zFar = max(zFar, zNear * 1.01);
+	puv = 0.0;
+	zg = 1e9;
+	[loop] for (int i = 0; i < 24; ++i)
+	{
+		const float z = zNear * pow(zFar / zNear, i / 23.0);
+		const float3 pm = warp(ray * z);
+		float2 n;
+		if (!bng_project(pm, n))
+			continue;
+		if (bng_depth(n) > -pm.z + 0.03)
+			continue; // still in front of whatever BeamNG drew there
+		float zk = z;
+		puv = n;
+		[loop] for (int k = 0; k < 3; ++k)
+		{
+			const float3 mk = warp(ray * zk);
+			float2 nk;
+			if (!bng_project(mk, nk))
+				break;
+			const float zb = bng_depth(nk);
+			if (zb > 1e8)
+				break;
+			puv = nk;
+			// BeamNG's surface point there, back in GTA's camera space: its depth along GTA's view axis
+			const float tanBng = BngTan * FovScale;
+			const float3 q = float3(((nk - Offset) * float2(2.0, -2.0) + float2(-1.0, 1.0)) * float2(tanBng * BngSize.x / BngSize.y, tanBng), -1.0) * zb - WarpT;
+			zk = -(q.x * WarpRow0.z + q.y * WarpRow1.z + q.z * WarpRow2.z);
+		}
+		zg = zk;
+		return true;
+	}
+	return false;
 }
 
 void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 outColor : SV_Target0, out float4 outInfo : SV_Target1)
@@ -78,23 +182,43 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 	outColor = float4(host, 1.0);
 	if (!BngActive)
 		return;
-	const float2 buv = bng_uv(uv);
 	const float zh = host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv, 0, 0)).x);
-	float4 car = tex2D(sBngColor, buv);
-	const float zb = bng_linear(tex2Dlod(sBngDepth, float4(buv, 0, 0)).r);
-	if (EdgeErode > 0.0 && car.a > 0.0)
-	{
-		// on the outline (a neighbour in BeamNG's picture is sky), fade the pixel: it holds some of BeamNG's sky
-		const float2 px = 1.0 / BngSize;
-		const float m = min(min(tex2Dlod(sBngColor, float4(buv + float2(px.x, 0), 0, 0)).a, tex2Dlod(sBngColor, float4(buv - float2(px.x, 0), 0, 0)).a),
-			min(tex2Dlod(sBngColor, float4(buv + float2(0, px.y), 0, 0)).a, tex2Dlod(sBngColor, float4(buv - float2(0, px.y), 0, 0)).a));
-		car *= lerp(1.0, m, EdgeErode);
-	}
 	outInfo = float4(0.0, 0.0, zh, 0.0);
 	if (DebugView == 1)
 	{
 		outColor = float4(bands(zh), 1.0);
 		return;
+	}
+	float2 buv;
+	float zb;
+	if (WarpOn && Reproject)
+	{
+		if (any(uv < CarRect.xy) || any(uv > CarRect.zw))
+		{
+			if (DebugView == 2 || DebugView == 3)
+				outColor = float4(host * 0.3, 1.0);
+			return;
+		}
+		if (!reproject(uv, min(zh + DepthBias, 400.0), buv, zb))
+		{
+			if (DebugView == 2 || DebugView == 3)
+				outColor = float4(host * 0.3, 1.0);
+			return;
+		}
+	}
+	else
+	{
+		buv = bng_uv(uv);
+		zb = bng_depth(buv);
+	}
+	float4 car = bng_color(buv);
+	if (EdgeErode > 0.0 && car.a > 0.0)
+	{
+		// on the outline (a neighbour in BeamNG's picture is sky), fade the pixel: it holds some of BeamNG's sky
+		const float2 px = 1.0 / BngSize;
+		const float m = min(min(bng_color(buv + float2(px.x, 0)).a, bng_color(buv - float2(px.x, 0)).a),
+			min(bng_color(buv + float2(0, px.y)).a, bng_color(buv - float2(0, px.y)).a));
+		car *= lerp(1.0, m, EdgeErode);
 	}
 	if (DebugView == 2)
 	{

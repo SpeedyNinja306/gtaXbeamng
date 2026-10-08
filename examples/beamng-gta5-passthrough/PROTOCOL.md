@@ -15,7 +15,7 @@ Orientations travel as a forward and an up unit vector.
 | `place` | `pos`, `fwd`, `up` | teleport the vehicle (keeps damage) |
 | `remove` | | delete the vehicle |
 | `input` | `th`, `br`, `st`, `hb` | throttle 0..1, brake 0..1, steering -1 (left)..1, handbrake 0..1 |
-| `cam` | `pos`, `fwd`, `up`, `fov` | drive BeamNG's free camera (vertical FOV, degrees) |
+| `cam` | `pos`, `fwd`, `up`, `fov`, `f`?, `aspect`?, `rel`? | drive BeamNG's camera (vertical FOV, degrees). `f`: tag (GTA's frame counter), stamped on every picture rendered with this camera. `rel` `{p, f, u}`: the same camera in the box frame of the car GTA draws (origin at the box centre, x right, y forward, z up); when present BeamNG renders from that offset to its own car at render time, so the car's motion drops out of the picture |
 | `tile` | `id`, `ox`, `oy`, `n`, `step`, `h` | ground heightfield: `n`x`n` heights, row-major (row = y), origin (`ox`,`oy`); `h` <= -9999 means no ground |
 | `walls` | `id`, `segs` | vertical wall quads, each `[x1, y1, x2, y2, zBottom, zTop]` |
 | `drop` | `id` | delete one tile or wall set |
@@ -38,6 +38,14 @@ Orientations travel as a forward and an up unit vector.
 | `crash` | `dmg`, `delta`, `pos` | damage jumped by `delta` this frame |
 | `gone` | | the vehicle no longer exists |
 | `probe` | `th`, `thIn`, `br`, `brIn`, `st`, `pb`, `gear`, `rpm`, `ign`, `running`, `ws`, `deflated` | vehicle electrics (applied and raw inputs, gear, rpm, ignition, wheel speed m/s, per-wheel tyre deflated 0/1) |
+
+## Bridge -> exporter (inside BeamNG)
+Right before BeamNG renders each frame, the bridge's camera mode sends the camera it renders with as one text
+datagram to `127.0.0.1:47802`, where the ReShade exporter listens:
+`gxbcam <tag> <flags> <fov> <px py pz> <fx fy fz> <ux uy uz>` (flags 1: car-relative, pose in the car's box frame;
+0: world pose). The exporter stamps the newest one on that frame's picture (`shared/gxb_frame.h`), and GTA uses it
+to re-project the picture to its current camera. BeamNG's LuaJIT doesn't allow declaring C functions, so the
+bridge can't write shared memory itself.
 
 ## Watchdog
 If no datagram arrives for 0.5 s, BeamNG pauses physics and zeroes the inputs, so the car doesn't roll
