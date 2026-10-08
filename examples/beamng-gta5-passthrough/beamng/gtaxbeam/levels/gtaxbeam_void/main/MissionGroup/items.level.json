@@ -1,0 +1,2 @@
+{"name":"PlayerDropPoints","class":"SimGroup","__parent":"MissionGroup","enabled":"1"}
+{"name":"Sky","class":"SimGroup","__parent":"MissionGroup"}

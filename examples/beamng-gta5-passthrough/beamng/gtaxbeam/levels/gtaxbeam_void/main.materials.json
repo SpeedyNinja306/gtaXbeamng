@@ -1,0 +1,28 @@
+{
+  "gtaxbeam_invisible": {
+    "name": "gtaxbeam_invisible",
+    "mapTo": "gtaxbeam_invisible",
+    "class": "Material",
+    "Stages": [
+      { "baseColorFactor": [1, 1, 1, 0], "opacityFactor": 0, "roughnessFactor": 1, "metallicFactor": 0 },
+      {}, {}, {}
+    ],
+    "alphaTest": true,
+    "alphaRef": 127,
+    "translucent": true,
+    "translucentZWrite": false,
+    "castShadows": false,
+    "version": 1.5
+  },
+  "gtaxbeam_debug": {
+    "name": "gtaxbeam_debug",
+    "mapTo": "gtaxbeam_debug",
+    "class": "Material",
+    "Stages": [
+      { "baseColorFactor": [0.15, 0.85, 0.35, 1], "roughnessFactor": 0.9, "metallicFactor": 0 },
+      {}, {}, {}
+    ],
+    "castShadows": false,
+    "version": 1.5
+  }
+}

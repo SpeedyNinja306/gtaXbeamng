@@ -1,0 +1,11 @@
+{
+    "title": "GTA x BeamNG void",
+    "description": "Empty level for the GTA V passthrough: GTA's world arrives as collision at runtime.",
+    "previews": [],
+    "size": [-1,-1],
+    "biome": "none",
+    "roads": "none",
+    "authors": "gtaXbeam",
+    "defaultSpawnPointName": "spawn_default",
+    "supportsTraffic": false
+}

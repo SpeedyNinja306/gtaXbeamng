@@ -1,0 +1,5 @@
+gta/third_party/
+gta/build/
+beamng/exporter/build/
+fakegta_out/
+__pycache__/

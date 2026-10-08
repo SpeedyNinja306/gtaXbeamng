@@ -1,0 +1,1 @@
+{"name":"spawn_default","class":"SpawnSphere","__parent":"PlayerDropPoints","position":[0,0,100],"autoplaceOnSpawn":"0","dataBlock":"SpawnSphereMarker","enabled":"1","radius":5}
